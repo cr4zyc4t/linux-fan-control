@@ -57,6 +57,24 @@ REAR_MAX_PWM=200
 # Gigabyte Z490 AORUS PRO AX / Z490 VISION D (SIV 0x6008090B), frankcrawford
 # it87 fork. Labels verified via "Sensors configs/Gigabyte/install-sensorsd.sh".
 #
+# Driver provenance (for OS reinstalls) - DKMS version installed on this
+# box was "it87/v2.0-6-gbd7a566.20261002":
+#
+#   repo    : https://github.com/frankcrawford/it87.git
+#   commit  : bd7a566c8a60fe0308d67e26761e16260368191a
+#             ("Merge pull request #140 from TsunamiMommy/fix-bridge",
+#             2026-10-02, `git describe`: v2.0-6-gbd7a566)
+#   install : git clone https://github.com/frankcrawford/it87.git
+#             cd it87 && git checkout bd7a566c8a60fe0308d67e26761e16260368191a
+#             sudo ./dkms-install.sh          # needs dkms + kernel headers
+#   runtime : /etc/modprobe.d/it87.conf       -> "options it87 mmio=1"
+#             /etc/modules-load.d/it87.conf   -> "it87" (load at boot)
+#   verify  : dkms status | grep it87
+#             sensors should show "it8688_6008090b" once mmio works
+#
+# Without mmio=1 the chip is not found and this script aborts. Do NOT
+# use the in-tree kernel it87 - it lacks the Gigabyte SIV/H2RAM support.
+#
 #   IT8688E (this script):
 #     fan1/pwm1 = CPU_FAN   -> left to BIOS. The EC runs the SmartFan curve,
 #                              but the it8688 duty register is NOT updated
