@@ -2,13 +2,57 @@
 
 set -u
 
+usage() {
+    echo "Usage: $0 [-n|--dry-run]"
+    echo "  -n, --dry-run  Calculate and log the fan curve only;"
+    echo "                 do NOT touch pwm*/enable (BIOS keeps control)."
+}
+
+DRY_RUN=0
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -n|--dry-run) DRY_RUN=1 ;;
+        -h|--help)    usage; exit 0 ;;
+        *)            echo "ERROR: unknown argument '$1'" >&2; usage >&2; exit 1 ;;
+    esac
+    shift
+done
+
+# Temperature -> duty curve, expressed in PERCENT (0-100).
+# All control math happens in %, conversion to the 255-base sysfs
+# register happens only at write time, inside pct_to_pwm().
+#
+# The curve tops out at 100%; loudness is limited via the per-fan
+# *_MAX_PWM caps below (the register value that means 100%), not by
+# clipping the duty here.
+MIN_PERCENT=20
+MAX_PERCENT=100
+
+# Temperature bounds of the linear curve.
 MIN_TEMP=50
 MAX_TEMP=70
 
-MIN_PWM=51
-MAX_PWM=230
-
 INTERVAL=3
+
+# ---------------------------------------------------------------------------
+# Per-fan configuration
+#
+#   <FAN>_MAX_PWM : the 255-base register value that means 100% for this fan.
+#                   All control math is done in percent; 100% duty is simply
+#                   written as this value. Lower it to cap the fan's top
+#                   speed (e.g. 200 out of 255 ~= 78% absolute maximum).
+# ---------------------------------------------------------------------------
+
+# CPU_FAN (fan1, BIOS-driven tachometer only). Cannot be capped from here
+# (the EC drives it); FULL_RPM is only used to estimate its duty %.
+CPU_FAN_FULL_RPM=2343
+
+# SYS_FAN3 / GPU intake fan (pwm4, tach fan4)
+INTAKE_MAX_PWM=230
+
+# SYS_FAN2 / rear case fan (pwm3, tach fan3)
+REAR_MAX_PWM=200
 
 # Gigabyte Z490 AORUS PRO AX / Z490 VISION D (SIV 0x6008090B), frankcrawford
 # it87 fork. Labels verified via "Sensors configs/Gigabyte/install-sensorsd.sh".
@@ -20,7 +64,7 @@ INTERVAL=3
 #                              1320->2343 RPM at PECI 76C), so CPU duty is
 #                              estimated from the tachometer instead.
 #     fan2/pwm2 = SYS_FAN1  -> empty header
-#     fan3/pwm3 = SYS_FAN2  -> rear case fan (max(CPU duty, GPU duty))
+#     fan3/pwm3 = SYS_FAN2  -> rear case fan (max(CPU %, GPU %))
 #     fan4/pwm4 = SYS_FAN3  -> GPU intake fan (follows GPU temp)
 #     fan5/pwm5 = CPU_OPT   -> left to BIOS (follows CPU cooler)
 #   IT8792E (not touched here): SYS_FAN4, SYS_FAN5_PUMP, SYS_FAN6_PUMP - all
@@ -52,12 +96,10 @@ PWM_ENABLE_PATH="$HWMON_DIR/pwm4_enable"
 
 # fan1 = CPU_FAN tachometer (BIOS keeps driving CPU_FAN).
 # The EC does not sync the pwm duty register in auto mode,
-# so CPU duty is estimated as fan RPM vs its measured 100% maximum
-# (2343 RPM observed under all-core stress with the fan unobstructed).
+# so CPU duty % is estimated as fan RPM vs its measured 100% maximum.
 CPU_FAN_RPM_PATH="$HWMON_DIR/fan1_input"
-CPU_FAN_MAX_RPM=2343
 
-# pwm3 = SYS_FAN2 rear case fan, follows max(CPU duty, GPU duty).
+# pwm3 = SYS_FAN2 rear case fan, follows max(CPU %, GPU %).
 REAR_PWM_PATH="$HWMON_DIR/pwm3"
 REAR_PWM_ENABLE_PATH="$HWMON_DIR/pwm3_enable"
 
@@ -83,44 +125,74 @@ restore_bios() {
     echo 2 > "$REAR_PWM_ENABLE_PATH" 2>/dev/null
     echo "$(date '+%Y-%m-%d %H:%M:%S') restored SYS_FAN2/SYS_FAN3 to BIOS (enable=2)"
 }
-trap 'exit 0' INT TERM
-trap restore_bios EXIT
+if [ "$DRY_RUN" -eq 0 ]; then
+    trap 'exit 0' INT TERM
+    trap restore_bios EXIT
+fi
 
 # Write a duty value; if the channel no longer accepts writes (EBUSY =
 # BIOS/SmartFan owns it again, e.g. a second controller or a stale
 # enable=2), give up so systemd Restart= re-initializes us from scratch.
+# In dry-run mode nothing is written at all.
 write_pwm() {
+    if [ "$DRY_RUN" -eq 1 ]; then
+        return 0
+    fi
     if ! echo "$1" > "$2" 2>/dev/null; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') ERROR: lost control of $2 -> exiting" >&2
         exit 1
     fi
 }
 
+# Convert a duty PERCENT (0-100) into the 255-base sysfs value, where
+# <max_pwm> is the register value that represents 100% for this fan.
+#
+#   pwm = percent * max_pwm / 100
+pct_to_pwm() {
+    local percent="$1" max_pwm="$2"
+    (( percent > 100 )) && percent=100
+    (( percent < 0 )) && percent=0
+    echo $(( percent * max_pwm / 100 ))
+}
+
+# Convert a tachometer RPM into duty PERCENT for the BIOS-driven CPU fan.
+rpm_to_pct() {
+    local rpm="$1" full_rpm="$2"
+    local pct=$(( rpm * 100 / full_rpm ))
+    (( pct > 100 )) && pct=100
+    echo "$pct"
+}
+
 echo "Using $HWMON_DIR ($(cat "$HWMON_DIR/name"))"
 echo "PWM: $PWM_PATH (SYS_FAN3/GPU intake) + $REAR_PWM_PATH (SYS_FAN2/rear fan)"
-echo "Ctrl-C hands control back to the BIOS (pwm*_enable=2)"
+echo "Max PWM (100%): intake=$INTAKE_MAX_PWM rear=$REAR_MAX_PWM (of 255)"
+if [ "$DRY_RUN" -eq 1 ]; then
+    echo "DRY RUN: curve is calculated and logged only, fans stay under BIOS control"
+else
+    echo "Ctrl-C hands control back to the BIOS (pwm*_enable=2)"
+fi
 
 # Put SYS_FAN3 and SYS_FAN2 into manual mode.
-echo 1 > "$PWM_ENABLE_PATH"
-echo 1 > "$REAR_PWM_ENABLE_PATH"
+if [ "$DRY_RUN" -eq 0 ]; then
+    echo 1 > "$PWM_ENABLE_PATH"
+    echo 1 > "$REAR_PWM_ENABLE_PATH"
+fi
 
 while true; do
     # Get temperatures from all NVIDIA GPUs.
     temps=$(nvidia-smi --query-gpu=temperature.gpu \
                        --format=csv,noheader,nounits 2>/dev/null)
 
-    # Estimate current CPU fan duty from the BIOS-driven CPU_FAN tachometer.
+    # Estimate current CPU fan duty % from the BIOS-driven CPU_FAN tachometer.
     cpu_rpm=$(cat "$CPU_FAN_RPM_PATH" 2>/dev/null)
     [[ "$cpu_rpm" =~ ^[0-9]+$ ]] || cpu_rpm=0
-
-    cpu_pwm=$(( cpu_rpm * 255 / CPU_FAN_MAX_RPM ))
-    (( cpu_pwm > 255 )) && cpu_pwm=255
+    cpu_pct=$(rpm_to_pct "$cpu_rpm" "$CPU_FAN_FULL_RPM")
 
     # Fail safe if nvidia-smi fails.
     if [ -z "$temps" ]; then
-        write_pwm "$MAX_PWM" "$PWM_PATH"
-        write_pwm "$MAX_PWM" "$REAR_PWM_PATH"
-        echo "$(date '+%Y-%m-%d %H:%M:%S') NVIDIA ERROR -> PWM=$MAX_PWM"
+        write_pwm "$(pct_to_pwm 100 "$INTAKE_MAX_PWM")" "$PWM_PATH"
+        write_pwm "$(pct_to_pwm 100 "$REAR_MAX_PWM")" "$REAR_PWM_PATH"
+        echo "$(date '+%Y-%m-%d %H:%M:%S') NVIDIA ERROR -> 100%"
         sleep "$INTERVAL"
         continue
     fi
@@ -136,48 +208,48 @@ while true; do
 
     # Fail safe if no valid temperature was found.
     if (( max_temp == 0 )); then
-        write_pwm "$MAX_PWM" "$PWM_PATH"
-        write_pwm "$MAX_PWM" "$REAR_PWM_PATH"
-        echo "$(date '+%Y-%m-%d %H:%M:%S') INVALID TEMP -> PWM=$MAX_PWM"
+        write_pwm "$(pct_to_pwm 100 "$INTAKE_MAX_PWM")" "$PWM_PATH"
+        write_pwm "$(pct_to_pwm 100 "$REAR_MAX_PWM")" "$REAR_PWM_PATH"
+        echo "$(date '+%Y-%m-%d %H:%M:%S') INVALID TEMP -> 100%"
         sleep "$INTERVAL"
         continue
     fi
 
-    # Linear PWM curve:
+    # Linear percent curve:
     #
-    # <= 50C -> 51
-    # 50-70C -> 51-230
-    # >= 70C -> 230
+    # <= 50C -> MIN_PERCENT
+    # 50-70C -> MIN_PERCENT-MAX_PERCENT
+    # >= 70C -> MAX_PERCENT
 
     if (( max_temp <= MIN_TEMP )); then
-        pwm="$MIN_PWM"
+        gpu_pct="$MIN_PERCENT"
 
     elif (( max_temp >= MAX_TEMP )); then
-        pwm="$MAX_PWM"
+        gpu_pct="$MAX_PERCENT"
 
     else
-        pwm=$(( MIN_PWM +
+        gpu_pct=$(( MIN_PERCENT +
             (max_temp - MIN_TEMP) *
-            (MAX_PWM - MIN_PWM) /
+            (MAX_PERCENT - MIN_PERCENT) /
             (MAX_TEMP - MIN_TEMP)
         ))
     fi
 
-    write_pwm "$pwm" "$PWM_PATH"
+    write_pwm "$(pct_to_pwm "$gpu_pct" "$INTAKE_MAX_PWM")" "$PWM_PATH"
 
-    # Rear fan = max(CPU duty, GPU duty).
-    rear_pwm="$pwm"
-    if (( cpu_pwm > rear_pwm )); then
-        rear_pwm="$cpu_pwm"
+    # Rear fan = max(CPU %, GPU %).
+    rear_pct="$gpu_pct"
+    if (( cpu_pct > rear_pct )); then
+        rear_pct="$cpu_pct"
     fi
 
-    write_pwm "$rear_pwm" "$REAR_PWM_PATH"
+    write_pwm "$(pct_to_pwm "$rear_pct" "$REAR_MAX_PWM")" "$REAR_PWM_PATH"
 
     # Log with tachometers: pwmN sysfs is stale on this chip, so fan
     # RPM is the only proof the writes above actually reached the fan.
     intake_rpm=$(cat "$HWMON_DIR/fan4_input" 2>/dev/null)
     rear_rpm=$(cat "$HWMON_DIR/fan3_input" 2>/dev/null)
-    echo "$(date '+%Y-%m-%d %H:%M:%S') GPU=${max_temp}°C PWM=${pwm}(${intake_rpm}rpm) CPU=${cpu_rpm}rpm/${cpu_pwm} REAR=${rear_pwm}(${rear_rpm}rpm)"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') GPU=${max_temp}°C INTAKE=${gpu_pct}%(${intake_rpm}rpm) CPU=${cpu_rpm}rpm/${cpu_pct}% REAR=${rear_pct}%(${rear_rpm}rpm)"
 
     sleep "$INTERVAL"
 done
