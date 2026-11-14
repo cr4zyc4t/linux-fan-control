@@ -30,8 +30,8 @@ MIN_PERCENT=20
 MAX_PERCENT=100
 
 # Temperature bounds of the linear curve.
-MIN_TEMP=50
-MAX_TEMP=70
+MIN_TEMP=45
+MAX_TEMP=75
 
 INTERVAL=3
 
@@ -49,7 +49,7 @@ INTERVAL=3
 CPU_FAN_FULL_RPM=2343
 
 # SYS_FAN3 / GPU intake fan (pwm4, tach fan4)
-INTAKE_MAX_PWM=230
+INTAKE_MAX_PWM=255
 
 # SYS_FAN2 / rear case fan (pwm3, tach fan3)
 REAR_MAX_PWM=200
