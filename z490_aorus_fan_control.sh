@@ -54,6 +54,9 @@ INTAKE_MAX_PWM=255
 # SYS_FAN2 / rear case fan (pwm3, tach fan3)
 REAR_MAX_PWM=200
 
+# SYS_FAN4 / second GPU support fan (IT8792E chip: pwm3, tach fan3)
+SUPPORT_MAX_PWM=255
+
 # Gigabyte Z490 AORUS PRO AX / Z490 VISION D (SIV 0x6008090B), frankcrawford
 # it87 fork. Labels verified via "Sensors configs/Gigabyte/install-sensorsd.sh".
 #
@@ -85,8 +88,12 @@ REAR_MAX_PWM=200
 #     fan3/pwm3 = SYS_FAN2  -> rear case fan (max(CPU %, GPU %))
 #     fan4/pwm4 = SYS_FAN3  -> GPU intake fan (follows GPU temp)
 #     fan5/pwm5 = CPU_OPT   -> left to BIOS (follows CPU cooler)
-#   IT8792E (not touched here): SYS_FAN4, SYS_FAN5_PUMP, SYS_FAN6_PUMP - all
-#     empty on this box. The it8792 is the chip that announced "H2RAM
+#   IT8792E (second chip, also driven here):
+#     fan1/pwm1 = SYS_FAN6_PUMP -> empty header
+#     fan2/pwm2 = SYS_FAN5_PUMP -> empty header
+#     fan3/pwm3 = SYS_FAN4      -> second GPU support fan (follows GPU temp;
+#                                  verified: fan3_input tracks SYS_FAN4 RPM)
+#   The it8792 is the chip that announced "H2RAM
 #     SmartFan ... channels=3" in dmesg; the it8688 rev 1 never does, which
 #     is exactly why its pwmN sysfs reads stay stale. Trust fanN_input, not
 #     pwmN, when checking what the system is really doing.
@@ -96,16 +103,26 @@ REAR_MAX_PWM=200
 # so match by prefix, not exact string.
 
 HWMON_DIR=""
+HWMON_DIR_8792=""
 
 for dir in /sys/class/hwmon/hwmon*; do
-    if [ -f "$dir/name" ] && [[ "$(cat "$dir/name")" == it8688* ]]; then
-        HWMON_DIR="$dir"
-        break
+    if [ -f "$dir/name" ]; then
+        chip_name=$(cat "$dir/name")
+        if [[ "$chip_name" == it8688* ]] && [ -z "$HWMON_DIR" ]; then
+            HWMON_DIR="$dir"
+        elif [[ "$chip_name" == it8792* ]] && [ -z "$HWMON_DIR_8792" ]; then
+            HWMON_DIR_8792="$dir"
+        fi
     fi
 done
 
 if [ -z "$HWMON_DIR" ]; then
     echo "ERROR: it8688 hwmon device not found (is the it87 fork loaded with mmio=1?)" >&2
+    exit 1
+fi
+
+if [ -z "$HWMON_DIR_8792" ]; then
+    echo "ERROR: it8792 hwmon device not found (SYS_FAN4 lives on this chip)" >&2
     exit 1
 fi
 
@@ -121,6 +138,10 @@ CPU_FAN_RPM_PATH="$HWMON_DIR/fan1_input"
 REAR_PWM_PATH="$HWMON_DIR/pwm3"
 REAR_PWM_ENABLE_PATH="$HWMON_DIR/pwm3_enable"
 
+# IT8792E pwm3 = SYS_FAN4 second GPU support fan, follows GPU temp.
+SUPPORT_PWM_PATH="$HWMON_DIR_8792/pwm3"
+SUPPORT_PWM_ENABLE_PATH="$HWMON_DIR_8792/pwm3_enable"
+
 if [ ! -e "$PWM_PATH" ] || [ ! -e "$PWM_ENABLE_PATH" ]; then
     echo "ERROR: pwm4 not found on $HWMON_DIR" >&2
     exit 1
@@ -131,7 +152,12 @@ if [ ! -e "$CPU_FAN_RPM_PATH" ] || [ ! -e "$REAR_PWM_PATH" ] || [ ! -e "$REAR_PW
     exit 1
 fi
 
-# On exit (Ctrl-C, kill, crash) hand both channels back to the BIOS
+if [ ! -e "$SUPPORT_PWM_PATH" ] || [ ! -e "$SUPPORT_PWM_ENABLE_PATH" ]; then
+    echo "ERROR: pwm3 not found on $HWMON_DIR_8792" >&2
+    exit 1
+fi
+
+# On exit (Ctrl-C, kill, crash) hand all channels back to the BIOS
 # SmartFan engine; otherwise the fans stay frozen at the last duty we
 # wrote forever, because enable=1 blocks the EC from controlling them.
 #
@@ -141,7 +167,8 @@ fi
 restore_bios() {
     echo 2 > "$PWM_ENABLE_PATH" 2>/dev/null
     echo 2 > "$REAR_PWM_ENABLE_PATH" 2>/dev/null
-    echo "$(date '+%Y-%m-%d %H:%M:%S') restored SYS_FAN2/SYS_FAN3 to BIOS (enable=2)"
+    echo 2 > "$SUPPORT_PWM_ENABLE_PATH" 2>/dev/null
+    echo "$(date '+%Y-%m-%d %H:%M:%S') restored SYS_FAN2/SYS_FAN3/SYS_FAN4 to BIOS (enable=2)"
 }
 if [ "$DRY_RUN" -eq 0 ]; then
     trap 'exit 0' INT TERM
@@ -182,18 +209,20 @@ rpm_to_pct() {
 }
 
 echo "Using $HWMON_DIR ($(cat "$HWMON_DIR/name"))"
-echo "PWM: $PWM_PATH (SYS_FAN3/GPU intake) + $REAR_PWM_PATH (SYS_FAN2/rear fan)"
-echo "Max PWM (100%): intake=$INTAKE_MAX_PWM rear=$REAR_MAX_PWM (of 255)"
+echo "Using $HWMON_DIR_8792 ($(cat "$HWMON_DIR_8792/name"))"
+echo "PWM: $PWM_PATH (SYS_FAN3/GPU intake) + $REAR_PWM_PATH (SYS_FAN2/rear fan) + $SUPPORT_PWM_PATH (SYS_FAN4/GPU support fan)"
+echo "Max PWM (100%): intake=$INTAKE_MAX_PWM rear=$REAR_MAX_PWM support=$SUPPORT_MAX_PWM (of 255)"
 if [ "$DRY_RUN" -eq 1 ]; then
     echo "DRY RUN: curve is calculated and logged only, fans stay under BIOS control"
 else
     echo "Ctrl-C hands control back to the BIOS (pwm*_enable=2)"
 fi
 
-# Put SYS_FAN3 and SYS_FAN2 into manual mode.
+# Put SYS_FAN3, SYS_FAN2 and SYS_FAN4 into manual mode.
 if [ "$DRY_RUN" -eq 0 ]; then
     echo 1 > "$PWM_ENABLE_PATH"
     echo 1 > "$REAR_PWM_ENABLE_PATH"
+    echo 1 > "$SUPPORT_PWM_ENABLE_PATH"
 fi
 
 while true; do
@@ -210,6 +239,7 @@ while true; do
     if [ -z "$temps" ]; then
         write_pwm "$(pct_to_pwm 100 "$INTAKE_MAX_PWM")" "$PWM_PATH"
         write_pwm "$(pct_to_pwm 100 "$REAR_MAX_PWM")" "$REAR_PWM_PATH"
+        write_pwm "$(pct_to_pwm 100 "$SUPPORT_MAX_PWM")" "$SUPPORT_PWM_PATH"
         echo "$(date '+%Y-%m-%d %H:%M:%S') NVIDIA ERROR -> 100%"
         sleep "$INTERVAL"
         continue
@@ -228,6 +258,7 @@ while true; do
     if (( max_temp == 0 )); then
         write_pwm "$(pct_to_pwm 100 "$INTAKE_MAX_PWM")" "$PWM_PATH"
         write_pwm "$(pct_to_pwm 100 "$REAR_MAX_PWM")" "$REAR_PWM_PATH"
+        write_pwm "$(pct_to_pwm 100 "$SUPPORT_MAX_PWM")" "$SUPPORT_PWM_PATH"
         echo "$(date '+%Y-%m-%d %H:%M:%S') INVALID TEMP -> 100%"
         sleep "$INTERVAL"
         continue
@@ -255,6 +286,9 @@ while true; do
 
     write_pwm "$(pct_to_pwm "$gpu_pct" "$INTAKE_MAX_PWM")" "$PWM_PATH"
 
+    # GPU support fan (SYS_FAN4) = same GPU curve as the intake fan.
+    write_pwm "$(pct_to_pwm "$gpu_pct" "$SUPPORT_MAX_PWM")" "$SUPPORT_PWM_PATH"
+
     # Rear fan = max(CPU %, GPU %).
     rear_pct="$gpu_pct"
     if (( cpu_pct > rear_pct )); then
@@ -267,7 +301,8 @@ while true; do
     # RPM is the only proof the writes above actually reached the fan.
     intake_rpm=$(cat "$HWMON_DIR/fan4_input" 2>/dev/null)
     rear_rpm=$(cat "$HWMON_DIR/fan3_input" 2>/dev/null)
-    echo "$(date '+%Y-%m-%d %H:%M:%S') GPU=${max_temp}°C INTAKE=${gpu_pct}%(${intake_rpm}rpm) CPU=${cpu_rpm}rpm/${cpu_pct}% REAR=${rear_pct}%(${rear_rpm}rpm)"
+    support_rpm=$(cat "$HWMON_DIR_8792/fan3_input" 2>/dev/null)
+    echo "$(date '+%Y-%m-%d %H:%M:%S') GPU=${max_temp}°C INTAKE=${gpu_pct}%(${intake_rpm}rpm) CPU=${cpu_rpm}rpm/${cpu_pct}% REAR=${rear_pct}%(${rear_rpm}rpm) SUPPORT=${gpu_pct}%(${support_rpm}rpm)"
 
     sleep "$INTERVAL"
 done
