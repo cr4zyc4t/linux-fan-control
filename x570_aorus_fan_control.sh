@@ -57,10 +57,13 @@ INTAKE_MAX_PWM=255
 REAR_MAX_PWM=200
 
 # SYS_FAN4 / second GPU support fan (IT8792E chip: pwm3, tach fan3)
-# NOTE: this fan has a stop/dead zone - at the 20% idle duty produced by the
-# curve below it does not spin at all. SUPPORT=20%(0rpm) in the log is normal
-# and does NOT mean the PWM write failed; it only starts once the duty rises.
+# NOTE: this fan has a fan-stop dead zone. It only starts reliably at ~40%
+# duty, stops completely at ~20%, and 20-40% makes it unstable. To avoid
+# that band entirely, its duty is forced to either 0% (fully stopped) or
+# >= SUPPORT_MIN_ACTIVE_PERCENT; see support_pct() below. SUPPORT=0%(0rpm)
+# in the log is therefore intentional, not a failed PWM write.
 SUPPORT_MAX_PWM=255
+SUPPORT_MIN_ACTIVE_PERCENT=45
 
 # Gigabyte X570 AORUS ULTRA (SIV 0x4008090B), frankcrawford it87 fork.
 # Mapping verified against "Sensors configs/Gigabyte/configs/
@@ -208,6 +211,18 @@ pct_to_pwm() {
     echo $(( percent * max_pwm / 100 ))
 }
 
+# GPU support fan (SYS_FAN4) has a fan-stop dead zone: it only starts at
+# ~40%, fully stops at ~20%, and 20-40% is unstable. Snap any duty below
+# the threshold to a full stop so it is only ever 0% or >= 45%.
+support_pct() {
+    local pct="$1"
+    if (( pct < SUPPORT_MIN_ACTIVE_PERCENT )); then
+        echo 0
+    else
+        echo "$pct"
+    fi
+}
+
 # Convert a tachometer RPM into duty PERCENT for the BIOS-driven CPU fan.
 rpm_to_pct() {
     local rpm="$1" full_rpm="$2"
@@ -294,8 +309,10 @@ while true; do
 
     write_pwm "$(pct_to_pwm "$gpu_pct" "$INTAKE_MAX_PWM")" "$INTAKE_PWM_PATH"
 
-    # GPU support fan (SYS_FAN4) = same GPU curve as the intake fan.
-    write_pwm "$(pct_to_pwm "$gpu_pct" "$SUPPORT_MAX_PWM")" "$SUPPORT_PWM_PATH"
+    # GPU support fan (SYS_FAN4) = same GPU curve as the intake fan, but
+    # with its dead zone removed: 0% below the threshold, >= 45% above it.
+    support_duty_pct=$(support_pct "$gpu_pct")
+    write_pwm "$(pct_to_pwm "$support_duty_pct" "$SUPPORT_MAX_PWM")" "$SUPPORT_PWM_PATH"
 
     # Rear fan (SYS_FAN1) = max(CPU %, GPU %).
     rear_pct="$gpu_pct"
@@ -310,7 +327,7 @@ while true; do
     intake_rpm=$(cat "$INTAKE_RPM_PATH" 2>/dev/null)
     rear_rpm=$(cat "$REAR_RPM_PATH" 2>/dev/null)
     support_rpm=$(cat "$SUPPORT_RPM_PATH" 2>/dev/null)
-    echo "$(date '+%Y-%m-%d %H:%M:%S') GPU=${max_temp}°C INTAKE=${gpu_pct}%(${intake_rpm}rpm) CPU=${cpu_rpm}rpm/${cpu_pct}% REAR=${rear_pct}%(${rear_rpm}rpm) SUPPORT=${gpu_pct}%(${support_rpm}rpm)"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') GPU=${max_temp}°C INTAKE=${gpu_pct}%(${intake_rpm}rpm) CPU=${cpu_rpm}rpm/${cpu_pct}% REAR=${rear_pct}%(${rear_rpm}rpm) SUPPORT=${support_duty_pct}%(${support_rpm}rpm)"
 
     sleep "$INTERVAL"
 done
