@@ -57,6 +57,9 @@ INTAKE_MAX_PWM=255
 REAR_MAX_PWM=200
 
 # SYS_FAN4 / second GPU support fan (IT8792E chip: pwm3, tach fan3)
+# NOTE: this fan has a stop/dead zone - at the 20% idle duty produced by the
+# curve below it does not spin at all. SUPPORT=20%(0rpm) in the log is normal
+# and does NOT mean the PWM write failed; it only starts once the duty rises.
 SUPPORT_MAX_PWM=255
 
 # Gigabyte X570 AORUS ULTRA (SIV 0x4008090B), frankcrawford it87 fork.
